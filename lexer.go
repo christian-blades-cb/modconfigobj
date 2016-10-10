@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"unicode"
@@ -14,14 +15,31 @@ const (
 	itemComment // includes hash (#)
 
 	itemKeyword
-	itemValue // includes quotes, if those exist
-	itemSection
-
-	itemLeftSection  // [
-	itemRightSection // ]
+	itemValue   // includes quotes, if those exist
+	itemSection // includes brackets
 
 	itemEOF
 )
+
+func (i itemType) String() string {
+	switch i {
+	case itemError:
+		return "Error"
+	case itemComment:
+		return "Comment"
+	case itemKeyword:
+		return "Keyword"
+	case itemValue:
+		return "Value"
+	case itemSection:
+		return "Section"
+	case itemEOF:
+		return "EOF"
+	default:
+		return "DOESNOTEXIST"
+	}
+
+}
 
 type token struct {
 	tokenType itemType
@@ -50,11 +68,32 @@ type Buffer interface {
 type lexer struct {
 	input          Reader
 	tokenValBuffer Buffer
+	prevRuneSize   int
 	position       int64
 	start          int64
 	tokenStream    chan token
+	state          stateFn
 }
 
+func newLexer(input Reader) *lexer {
+	return &lexer{
+		state:          lexGeneric,
+		input:          input,
+		tokenValBuffer: bytes.NewBuffer(nil),
+		tokenStream:    make(chan token, 3),
+	}
+}
+
+func (l *lexer) nextItem() token {
+	for {
+		select {
+		case t := <-l.tokenStream:
+			return t
+		default:
+			l.state = l.state(l)
+		}
+	}
+}
 func (l *lexer) run() {
 	for state := lexGeneric; state != nil; {
 		state = state(l)
@@ -66,35 +105,33 @@ type stateFn func(*lexer) stateFn
 
 func lexGeneric(l *lexer) stateFn {
 	l.skipWhitespace()
+	l.resetTokenBuffer()
+
 	var r rune
-	var n int
 	var err error
 
 	for {
-		r, n, err = l.input.ReadRune()
-		if err == io.EOF {
+		r, err = l.next()
+		if err != nil {
+			l.resetTokenBuffer()
 			l.emit(itemEOF)
 			return nil
-		} else if err != nil {
-			l.emit(itemError)
-			panic(err)
 		}
 
 		switch r {
 		case '[':
-			l.input.UnreadRune()
+			l.backup()
 			return lexSection
 		case '#':
-			l.input.UnreadRune()
+			l.backup()
 			return lexComment
 		case '\n':
-			l.position += int64(n)
 			return lexGeneric
 		case '=':
-			l.position += int64(n)
 			l.emit(itemError)
+			return lexGeneric
 		default:
-			l.position += int64(n)
+			l.backup()
 			return lexKey
 		}
 	}
@@ -102,289 +139,126 @@ func lexGeneric(l *lexer) stateFn {
 
 func lexKey(l *lexer) stateFn {
 	var r rune
-	var n int
 	var err error
 
-	l.start = l.position
-	l.tokenValBuffer.Reset()
+	l.resetTokenBuffer()
+
 	for {
-		r, n, err = l.input.ReadRune()
-		if err == io.EOF {
+		r, err = l.next()
+		if err != nil {
 			l.emit(itemError)
 			l.emit(itemEOF)
-		} else if err != nil {
-			l.emit(itemError)
-			panic(err)
+			return nil
 		}
+
 		switch r {
 		case '\n':
-			l.position += int64(n)
 			l.emit(itemError)
 			return lexGeneric
 		case '=':
-			if l.position == l.start { // empty key?
-				l.position += int64(n)
+			if l.position-int64(l.prevRuneSize) == l.start { // empty key?
 				l.emit(itemError)
 				return lexGeneric
 			}
-			l.position += int64(n)
+
+			l.backup()
 			l.emit(itemKeyword)
-			l.position += int64(n)
+			l.next()
 			return lexValue
-		default:
-			l.position += int64(n)
 		}
 	}
 }
 
 func lexValue(l *lexer) stateFn {
 	l.skipWhitespace()
+	l.resetTokenBuffer()
 
 	var r rune
-	var n int
 	var err error
 
-	l.start = l.position
-	l.tokenValBuffer.Reset()
-
 	for {
-		r, n, err = l.input.ReadRune()
-		if err == io.EOF {
-			if l.position == l.start { // no value for key/value pair
-				l.handleUnexpectedEOF(n)
-				return nil
-			} else if err != nil {
-				l.emit(itemError)
-				panic(err)
-			}
+		r, err = l.next()
+		if err != nil {
+			l.emit(itemValue)
+			l.emit(itemEOF)
+			return nil
 		}
 
 		switch r {
-		case '"':
-			if l.position == l.start { // key = "
-				l.input.UnreadRune()
-				if err != nil {
-					l.emit(itemError)
-					panic(err)
-				}
-				return lexDoubleQuote
+		case '"', '\'':
+			if l.position-int64(l.prevRuneSize) == l.start {
+				l.backup()
+				return lexQuotedValue(r, l)
 			}
-
-			l.consumeRune(r, n)
-
-		case '\'':
-			if l.position == l.start { // key = '
-				l.input.UnreadRune()
-				if err != nil {
-					l.emit(itemError)
-					panic(err)
-				}
-				return lexSingleQuote
-			}
-
-			l.consumeRune(r, n)
-
 		case '\n':
-			if l.position == l.start { // key = <EOL>
-				l.position += int64(n)
-				l.emit(itemError)
-				return lexGeneric
-			}
-
 			l.emit(itemValue)
-			l.position += int64(n)
 			return lexGeneric
-
-		default:
-			l.consumeRune(r, n)
 		}
 	}
 }
 
 func lexQuotedValue(quoteRune rune, l *lexer) stateFn {
-	var r rune
-	var n int
 	var err error
 
-	l.start = l.position
-	l.tokenValBuffer.Reset()
+	l.resetTokenBuffer()
 
 	numQuotes, err := l.takeRunes(quoteRune, 3)
-	if err == io.EOF {
+	if err != nil {
 		l.emit(itemError)
 		l.emit(itemEOF)
 		return nil
-	} else if err != nil {
-		l.emit(itemValue)
-		panic(err)
 	}
 
 	switch numQuotes {
 	case 1, 3:
 		for {
 			endQuotes, err := l.takeRunes(quoteRune, numQuotes)
-			if err == io.EOF {
+			if err != nil {
 				l.emit(itemError)
 				l.emit(itemEOF)
 				return nil
-			} else if err != nil {
-				l.emit(itemValue)
-				panic(err)
 			}
-
 			if endQuotes == numQuotes {
 				l.emit(itemValue)
 				return lexGeneric
 			}
 
-			r, n, err = l.input.ReadRune()
-			if err == io.EOF {
+			_, err = l.next()
+			if err != io.EOF {
 				l.emit(itemError)
 				l.emit(itemEOF)
 				return nil
-			} else if err != nil {
-				l.emit(itemValue)
-				panic(err)
 			}
-
-			l.consumeRune(r, n)
 		}
 	default:
-		l.consumeRune(r, n)
 		l.emit(itemError)
 		return lexGeneric
 	}
-
 }
 
 func lexSingleQuote(l *lexer) stateFn {
-	var r rune
-	var n int
-	var err error
-
-	l.start = l.position
-	l.tokenValBuffer.Reset()
-
-	numQuotes, err := l.takeRunes('"', 3)
-	if err == io.EOF {
-		l.emit(itemError)
-		l.emit(itemEOF)
-		return nil
-	} else if err != nil {
-		l.emit(itemValue)
-		panic(err)
-	}
-
-	switch numQuotes {
-	case 1, 3:
-		for {
-			endQuotes, err := l.takeRunes('\'', numQuotes)
-			if err == io.EOF {
-				l.emit(itemError)
-				l.emit(itemEOF)
-				return nil
-			} else if err != nil {
-				l.emit(itemValue)
-				panic(err)
-			}
-
-			if endQuotes == numQuotes {
-				l.emit(itemValue)
-				return lexGeneric
-			}
-
-			r, n, err = l.input.ReadRune()
-			if err == io.EOF {
-				l.emit(itemError)
-				l.emit(itemEOF)
-				return nil
-			} else if err != nil {
-				l.emit(itemValue)
-				panic(err)
-			}
-
-			l.consumeRune(r, n)
-		}
-	default:
-		l.consumeRune(r, n)
-		l.emit(itemError)
-		return lexGeneric
-	}
-
+	return lexQuotedValue('\'', l)
 }
 
 func lexDoubleQuote(l *lexer) stateFn {
-	var r rune
-	var n int
-	var err error
-
-	l.start = l.position
-	l.tokenValBuffer.Reset()
-
-	numQuotes, err := l.takeRunes('"', 3)
-	if err == io.EOF {
-		l.emit(itemError)
-		l.emit(itemEOF)
-		return nil
-	} else if err != nil {
-		l.emit(itemValue)
-		panic(err)
-	}
-
-	switch numQuotes {
-	case 1, 3:
-		for {
-			endQuotes, err := l.takeRunes('"', numQuotes)
-			if err == io.EOF {
-				l.emit(itemError)
-				l.emit(itemEOF)
-				return nil
-			} else if err != nil {
-				l.emit(itemValue)
-				panic(err)
-			}
-
-			if endQuotes == numQuotes {
-				l.emit(itemValue)
-				return lexGeneric
-			}
-
-			r, n, err = l.input.ReadRune()
-			if err == io.EOF {
-				l.emit(itemError)
-				l.emit(itemEOF)
-				return nil
-			} else if err != nil {
-				l.emit(itemValue)
-				panic(err)
-			}
-
-			l.consumeRune(r, n)
-		}
-	default:
-		l.consumeRune(r, n)
-		l.emit(itemError)
-		return lexGeneric
-	}
+	return lexQuotedValue('"', l)
 }
 
 func (l *lexer) acceptRun(accept rune) (numRunes int, err error) {
 	var r rune
-	var n int
 
 	for {
-		r, n, err = l.input.ReadRune()
+		r, err = l.next()
 		if err != nil {
 			return
 		}
 
-		if r == accept {
-			numRunes++
-			l.consumeRune(r, n)
-		} else {
-			l.input.UnreadRune()
+		if r != accept {
+			r.backup()
 			return
 		}
+
+		numRunes++
 	}
 }
 
@@ -430,70 +304,40 @@ func lexComment(l *lexer) stateFn {
 
 func lexSection(l *lexer) stateFn {
 	var r rune
-	var n int
 	var err error
+	var sectionDepth int
 
-	l.start = l.position
-	sectionDepth := 0
-	startName := false
+	l.resetTokenBuffer()
 
+	sectionDepth, err = l.acceptRun('[')
+	if sectionDepth == 0 {
+		l.emit(itemError)
+		return lexGeneric
+	}
+
+	var endSectionRun int
 	for {
-		r, n, err = l.input.ReadRune()
-		if err == io.EOF {
+		endSectionRun, err = l.takeRunes(']', sectionDepth)
+		if err != nil {
 			l.emit(itemError)
 			l.emit(itemEOF)
 			return nil
-		} else if err != nil {
+		}
+		if endSectionRun == sectionDepth {
+			l.emit(itemSection)
+			return lexGeneric
+		}
+
+		r, err = l.next()
+		if err != nil {
 			l.emit(itemError)
-			panic(err)
+			l.emit(itemEOF)
+			return nil
 		}
 
-		if unicode.IsSpace(r) {
-			startName = true
-			if err := l.input.UnreadRune(); err != nil {
-				panic(err)
-			}
-			l.position++
-		}
-
-		switch r {
-		case ']':
-			if startName {
-				l.emit(itemSection)
-			}
-
-			l.consumeRune(r, n)
-
-			if sectionDepth < 1 {
-				l.emit(itemError)
-				return lexGeneric
-			}
-
-			l.emit(itemRightSection)
-			sectionDepth--
-
-			if sectionDepth == 0 {
-				return lexGeneric
-			}
-
-		case '[':
-			if startName {
-				l.consumeRune(r, n)
-				continue
-			}
-
-			l.consumeRune(r, n)
-			l.emit(itemLeftSection)
-			sectionDepth++
-
-		case '\n':
-			l.consumeRune(r, n)
+		if r == '\n' {
 			l.emit(itemError)
 			return lexGeneric
-
-		default:
-			startName = true
-			l.consumeRune(r, n)
 		}
 	}
 }
@@ -506,26 +350,24 @@ func (l *lexer) emit(t itemType) {
 		value:     l.tokenValBuffer.String(),
 	}
 
-	l.start = l.position
-	l.tokenValBuffer.Reset()
+	l.resetTokenBuffer()
 }
 
 func (l *lexer) skipWhitespace() {
+	var r rune
+	var err error
+
 	for {
-		r, n, err := l.input.ReadRune()
+		r, err = l.next()
 		if err != nil {
 			panic(err)
 		}
-		if !unicode.IsSpace(r) {
-			break
-		}
 
-		l.position += int64(n)
+		if !unicode.IsSpace(r) {
+			l.backup()
+			l.resetTokenBuffer()
+		}
 	}
-	if err := l.input.UnreadRune(); err != nil {
-		panic(err)
-	}
-	l.start = l.position
 }
 
 func (l *lexer) consumeRune(r rune, n int) {
@@ -533,20 +375,54 @@ func (l *lexer) consumeRune(r rune, n int) {
 	l.tokenValBuffer.WriteRune(r)
 }
 
+func (l *lexer) next() (r rune, err error) {
+	var size int
+	r, size, err = l.input.ReadRune()
+	if err != io.EOF && err != nil {
+		l.emit(itemError)
+		panic(err)
+	}
+
+	l.consumeRune(r, size)
+	l.prevRuneSize = size
+
+	return
+}
+
+func (l *lexer) backup() {
+	if l.prevRuneSize == 0 {
+		panic("backup called before a call to next")
+	}
+
+	err := l.input.UnreadRune()
+	if err != nil {
+		l.emit(itemError)
+		panic(err)
+	}
+
+	l.position -= int64(l.prevRuneSize)
+	l.prevRuneSize = 0
+}
+
+func (l *lexer) resetTokenBuffer() {
+	l.start = l.position
+	l.tokenValBuffer.Reset()
+}
+
 func (l *lexer) takeRunes(accept rune, max int) (taken int, err error) {
 	var r rune
-	var n int
 
 	for i := 0; i < max; i++ {
-		r, n, err = l.input.ReadRune()
+		r, err = l.next()
 		if err != nil {
 			return
 		}
+
 		if r != accept {
-			err = l.input.UnreadRune()
+			l.backup()
 			return
 		}
-		l.consumeRune(r, n)
+
 		taken++
 	}
 
