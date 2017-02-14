@@ -60,6 +60,8 @@ type Reader interface {
 
 // Buffer supports writing runes, emitting strings, and resetting its contents
 type Buffer interface {
+	Truncate(n int)
+	Len() int
 	WriteRune(rune) (int, error)
 	String() string
 	Reset()
@@ -93,12 +95,6 @@ func (l *lexer) nextItem() token {
 			l.state = l.state(l)
 		}
 	}
-}
-func (l *lexer) run() {
-	for state := lexGeneric; state != nil; {
-		state = state(l)
-	}
-	close(l.tokenStream)
 }
 
 type stateFn func(*lexer) stateFn
@@ -191,7 +187,9 @@ func lexValue(l *lexer) stateFn {
 				return lexQuotedValue(r, l)
 			}
 		case '\n':
+			l.backup()
 			l.emit(itemValue)
+			l.next()
 			return lexGeneric
 		}
 	}
@@ -254,7 +252,7 @@ func (l *lexer) acceptRun(accept rune) (numRunes int, err error) {
 		}
 
 		if r != accept {
-			r.backup()
+			l.backup()
 			return
 		}
 
@@ -310,7 +308,7 @@ func lexSection(l *lexer) stateFn {
 	l.resetTokenBuffer()
 
 	sectionDepth, err = l.acceptRun('[')
-	if sectionDepth == 0 {
+	if sectionDepth == 0 || err != nil {
 		l.emit(itemError)
 		return lexGeneric
 	}
@@ -360,12 +358,16 @@ func (l *lexer) skipWhitespace() {
 	for {
 		r, err = l.next()
 		if err != nil {
+			if err == io.EOF {
+				return
+			}
 			panic(err)
 		}
 
 		if !unicode.IsSpace(r) {
 			l.backup()
 			l.resetTokenBuffer()
+			return
 		}
 	}
 }
@@ -400,6 +402,7 @@ func (l *lexer) backup() {
 		panic(err)
 	}
 
+	l.tokenValBuffer.Truncate(l.tokenValBuffer.Len() - l.prevRuneSize)
 	l.position -= int64(l.prevRuneSize)
 	l.prevRuneSize = 0
 }
