@@ -10,14 +10,29 @@ import (
 type itemType int
 
 const (
+	// ItemError is an invalid token
 	ItemError itemType = iota
 
-	itemComment // includes hash (#)
+	// ItemComment is a comment token
+	// Note: includes the hash (#)
+	ItemComment
 
-	ItemKeyword
-	ItemValue   // includes quotes, if those exist
-	ItemSection // includes brackets
+	// ItemKey is a key from a key/value pair
+	ItemKey
 
+	// ItemValue is the value of a key/value pair
+	//
+	// Note: token value includes quotes (if those exist)
+	ItemValue
+
+	// ItemSection is a section
+	//
+	// unlike unix-style config files, sections may be nested
+	//
+	// Note: token value includes brackets
+	ItemSection
+
+	// ItemEOF is the final token returned when the lexer reaches the end of a file
 	ItemEOF
 )
 
@@ -25,9 +40,9 @@ func (i itemType) String() string {
 	switch i {
 	case ItemError:
 		return "Error"
-	case itemComment:
+	case ItemComment:
 		return "Comment"
-	case ItemKeyword:
+	case ItemKey:
 		return "Keyword"
 	case ItemValue:
 		return "Value"
@@ -41,14 +56,17 @@ func (i itemType) String() string {
 
 }
 
-type token struct {
+// Token is the representation of lexeme and category. Len and
+// Position are also available for applications such as mutating a
+// file in-place. Units for Len and Position are bytes.
+type Token struct {
 	TokenType itemType
 	Position  int64
-	len       int64
+	Len       int64
 	Value     string
 }
 
-func (t token) String() string {
+func (t Token) String() string {
 	return fmt.Sprintf("token %s at %d: \"%s\"", t.TokenType, t.Position, t.Value)
 }
 
@@ -67,26 +85,31 @@ type Buffer interface {
 	Reset()
 }
 
+// Lexer tokenizes the configobj file
 type Lexer struct {
 	input          Reader
 	tokenValBuffer Buffer
 	prevRuneSize   int
 	Position       int64
 	start          int64
-	tokenStream    chan token
+	tokenStream    chan Token
 	state          stateFn
 }
 
+// NewLexer initializes a Lexer for the given input
 func NewLexer(input Reader) *Lexer {
 	return &Lexer{
 		state:          lexGeneric,
 		input:          input,
 		tokenValBuffer: bytes.NewBuffer(nil),
-		tokenStream:    make(chan token, 3),
+		tokenStream:    make(chan Token, 3),
 	}
 }
 
-func (l *Lexer) NextItem() token {
+// NextItem provides the next token from the lexer's stream. It is the
+// caller's resposibility to check for a ItemEOF token which signals
+// the end of the token stream.
+func (l *Lexer) NextItem() Token {
 	for {
 		select {
 		case t := <-l.tokenStream:
@@ -158,7 +181,7 @@ func lexKey(l *Lexer) stateFn {
 			}
 
 			l.backup()
-			l.emit(ItemKeyword)
+			l.emit(ItemKey)
 			l.next()
 			return lexValue
 		}
@@ -278,7 +301,7 @@ func lexComment(l *Lexer) stateFn {
 		r, n, err = l.input.ReadRune()
 		if err == io.EOF {
 			if l.Position != l.start {
-				l.emit(itemComment)
+				l.emit(ItemComment)
 			}
 			l.emit(ItemEOF)
 			return nil
@@ -290,7 +313,7 @@ func lexComment(l *Lexer) stateFn {
 		switch r {
 		case '\n':
 			if l.Position != l.start {
-				l.emit(itemComment)
+				l.emit(ItemComment)
 			}
 			l.Position += int64(n)
 			return lexGeneric
@@ -341,10 +364,10 @@ func lexSection(l *Lexer) stateFn {
 }
 
 func (l *Lexer) emit(t itemType) {
-	l.tokenStream <- token{
+	l.tokenStream <- Token{
 		TokenType: t,
 		Position:  l.start,
-		len:       l.Position - l.start,
+		Len:       l.Position - l.start,
 		Value:     l.tokenValBuffer.String(),
 	}
 

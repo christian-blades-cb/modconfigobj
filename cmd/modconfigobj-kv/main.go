@@ -50,7 +50,7 @@ func printKVs(lex *modconfigobj.Lexer) {
 			}
 			cleanSectionName := strings.TrimSpace(strings.TrimLeft(strings.TrimRight(t.Value, "]"), "["))
 			sectionStack = append(sectionStack[:depth], cleanSectionName)
-		case modconfigobj.ItemKeyword:
+		case modconfigobj.ItemKey:
 			valueToken := lex.NextItem()
 			if valueToken.TokenType != modconfigobj.ItemValue {
 				fmt.Printf("unexpected token at %d: %v", valueToken.Position, valueToken)
