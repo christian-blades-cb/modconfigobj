@@ -1,3 +1,3 @@
 # modconfigobj
 
-Tool for idempotent modifications to configobj files
+Tools for working with configobj files in golang
